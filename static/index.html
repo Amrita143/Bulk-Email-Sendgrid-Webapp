@@ -1,0 +1,775 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Email Campaign Manager</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; }
+        
+        .container { max-width: 960px; margin: 0 auto; padding: 24px 16px; }
+        
+        h1 { font-size: 1.75rem; font-weight: 700; color: #f1f5f9; margin-bottom: 4px; }
+        .subtitle { color: #94a3b8; font-size: 0.9rem; margin-bottom: 32px; }
+        
+        /* Steps / Sections */
+        .step { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 24px; margin-bottom: 20px; }
+        .step.disabled { opacity: 0.4; pointer-events: none; }
+        .step-header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+        .step-number { background: #3b82f6; color: white; width: 32px; height: 32px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 0.85rem; flex-shrink: 0; }
+        .step-number.done { background: #22c55e; }
+        .step-title { font-size: 1.1rem; font-weight: 600; color: #f1f5f9; }
+        
+        /* Form elements */
+        label { display: block; font-size: 0.85rem; color: #94a3b8; margin-bottom: 6px; font-weight: 500; }
+        input[type="text"], input[type="email"], input[type="number"], select {
+            width: 100%; padding: 10px 14px; background: #0f172a; border: 1px solid #475569;
+            border-radius: 8px; color: #e2e8f0; font-size: 0.9rem; margin-bottom: 12px;
+        }
+        input:focus, select:focus { outline: none; border-color: #3b82f6; box-shadow: 0 0 0 3px rgba(59,130,246,0.15); }
+        
+        .btn { padding: 10px 20px; border-radius: 8px; font-weight: 600; font-size: 0.9rem; cursor: pointer; border: none; transition: all 0.15s; }
+        .btn-primary { background: #3b82f6; color: white; }
+        .btn-primary:hover { background: #2563eb; }
+        .btn-primary:disabled { background: #475569; cursor: not-allowed; }
+        .btn-success { background: #22c55e; color: white; }
+        .btn-success:hover { background: #16a34a; }
+        .btn-danger { background: #ef4444; color: white; }
+        .btn-danger:hover { background: #dc2626; }
+        .btn-outline { background: transparent; border: 1px solid #475569; color: #94a3b8; }
+        .btn-outline:hover { border-color: #3b82f6; color: #3b82f6; }
+        .btn-sm { padding: 6px 14px; font-size: 0.8rem; }
+        
+        .row { display: flex; gap: 12px; flex-wrap: wrap; }
+        .row > * { flex: 1; min-width: 200px; }
+        
+        /* File upload */
+        .file-drop { border: 2px dashed #475569; border-radius: 10px; padding: 32px; text-align: center; cursor: pointer; transition: all 0.2s; }
+        .file-drop:hover, .file-drop.dragover { border-color: #3b82f6; background: rgba(59,130,246,0.05); }
+        .file-drop input { display: none; }
+        .file-drop p { color: #94a3b8; font-size: 0.9rem; }
+        .file-drop .icon { font-size: 2rem; margin-bottom: 8px; }
+        
+        /* Tags / badges */
+        .tag { display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 0.75rem; font-weight: 600; margin: 2px; }
+        .tag-blue { background: rgba(59,130,246,0.15); color: #60a5fa; }
+        .tag-green { background: rgba(34,197,94,0.15); color: #4ade80; }
+        .tag-red { background: rgba(239,68,68,0.15); color: #f87171; }
+        .tag-yellow { background: rgba(234,179,8,0.15); color: #facc15; }
+        
+        /* Messages */
+        .msg { padding: 12px 16px; border-radius: 8px; font-size: 0.85rem; margin: 12px 0; }
+        .msg-success { background: rgba(34,197,94,0.1); border: 1px solid rgba(34,197,94,0.3); color: #4ade80; }
+        .msg-error { background: rgba(239,68,68,0.1); border: 1px solid rgba(239,68,68,0.3); color: #f87171; }
+        .msg-info { background: rgba(59,130,246,0.1); border: 1px solid rgba(59,130,246,0.3); color: #60a5fa; }
+        
+        /* Progress dashboard */
+        .progress-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin: 16px 0; }
+        .stat-card { background: #0f172a; border: 1px solid #334155; border-radius: 10px; padding: 16px; text-align: center; }
+        .stat-value { font-size: 1.5rem; font-weight: 700; color: #f1f5f9; }
+        .stat-label { font-size: 0.75rem; color: #64748b; margin-top: 4px; text-transform: uppercase; letter-spacing: 0.5px; }
+        
+        .progress-bar-container { background: #0f172a; border-radius: 8px; height: 24px; overflow: hidden; margin: 12px 0; position: relative; }
+        .progress-bar { height: 100%; border-radius: 8px; transition: width 0.5s ease; display: flex; }
+        .progress-sent { background: linear-gradient(90deg, #22c55e, #4ade80); }
+        .progress-failed { background: #ef4444; }
+        .progress-text { position: absolute; width: 100%; text-align: center; line-height: 24px; font-size: 0.8rem; font-weight: 600; color: white; text-shadow: 0 1px 2px rgba(0,0,0,0.5); }
+        
+        /* Status indicator */
+        .status-indicator { display: inline-flex; align-items: center; gap: 6px; padding: 4px 12px; border-radius: 20px; font-size: 0.8rem; font-weight: 600; }
+        .status-running { background: rgba(59,130,246,0.15); color: #60a5fa; }
+        .status-running::before { content: ''; width: 8px; height: 8px; border-radius: 50%; background: #3b82f6; animation: pulse 1.5s infinite; }
+        .status-completed { background: rgba(34,197,94,0.15); color: #4ade80; }
+        .status-completed::before { content: ''; width: 8px; height: 8px; border-radius: 50%; background: #22c55e; }
+        .status-cancelled { background: rgba(234,179,8,0.15); color: #facc15; }
+        .status-failed { background: rgba(239,68,68,0.15); color: #f87171; }
+        
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+        
+        /* Error log */
+        .error-log { max-height: 200px; overflow-y: auto; background: #0f172a; border-radius: 8px; padding: 12px; margin-top: 12px; font-size: 0.8rem; font-family: 'Consolas', monospace; }
+        .error-log-entry { padding: 4px 0; border-bottom: 1px solid #1e293b; color: #f87171; }
+        
+        /* Table preview */
+        .preview-table { width: 100%; overflow-x: auto; margin: 12px 0; }
+        .preview-table table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+        .preview-table th { background: #0f172a; padding: 8px 12px; text-align: left; color: #94a3b8; font-weight: 600; border-bottom: 2px solid #334155; white-space: nowrap; }
+        .preview-table td { padding: 6px 12px; border-bottom: 1px solid #1e293b; color: #cbd5e1; white-space: nowrap; max-width: 200px; overflow: hidden; text-overflow: ellipsis; }
+        
+        /* Campaign history */
+        .history-card { background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 14px; margin: 8px 0; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
+        .history-card .meta { font-size: 0.8rem; color: #64748b; }
+        
+        .hidden { display: none !important; }
+        .mt-8 { margin-top: 8px; }
+        .mt-16 { margin-top: 16px; }
+        .mb-12 { margin-bottom: 12px; }
+        .text-center { text-align: center; }
+        .text-sm { font-size: 0.85rem; }
+        .text-muted { color: #64748b; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>&#9993; Email Campaign Manager</h1>
+        <p class="subtitle">Upload template, validate data, configure &amp; launch. Campaigns run on the cloud server even if you close this page.</p>
+
+        <!-- ========== STEP 1: Upload Template ========== -->
+        <div class="step" id="step1">
+            <div class="step-header">
+                <div class="step-number" id="step1-num">1</div>
+                <div class="step-title">Upload Email Template (.html)</div>
+            </div>
+            <div class="file-drop" id="template-drop" onclick="document.getElementById('template-input').click()">
+                <input type="file" id="template-input" accept=".html,.htm" />
+                <div class="icon">&#128196;</div>
+                <p>Click or drag your HTML email template here</p>
+            </div>
+            <div id="template-result" class="hidden">
+                <div class="msg msg-success" id="template-msg"></div>
+                <div id="template-fields"></div>
+            </div>
+        </div>
+
+        <!-- ========== STEP 2: Test Email (Optional) ========== -->
+        <div class="step disabled" id="step2">
+            <div class="step-header">
+                <div class="step-number" id="step2-num">2</div>
+                <div class="step-title">Send Test Email (Optional)</div>
+            </div>
+            <p class="text-sm text-muted mb-12">Send a test email to verify the template renders correctly before launching the campaign.</p>
+            <div class="row">
+                <div>
+                    <label>To Email (test recipient)</label>
+                    <input type="email" id="test-to-email" placeholder="your-email@example.com" />
+                </div>
+                <div>
+                    <label>From Email</label>
+                    <input type="email" id="test-from-email" value="consumer.notification@astraglobal.info" />
+                </div>
+            </div>
+            <label>Subject Pattern</label>
+            <input type="text" id="test-subject" value="VALIDATION LETTER- %%First_Name%% %%Middle_Name%% %%Last_Name%%" />
+            <label>Unsubscribe Group ID</label>
+            <input type="number" id="test-unsub-id" value="25279" />
+            <p class="text-sm text-muted mb-12">Test data (first row of CSV will be used, or enter manually):</p>
+            <div id="test-fields-container"></div>
+            <div class="row mt-8">
+                <button class="btn btn-primary" onclick="sendTestEmail()">Send Test Email</button>
+                <button class="btn btn-outline" onclick="skipTest()">Skip Test &rarr;</button>
+            </div>
+            <div id="test-result" class="hidden"></div>
+        </div>
+
+        <!-- ========== STEP 3: Upload CSV ========== -->
+        <div class="step disabled" id="step3">
+            <div class="step-header">
+                <div class="step-number" id="step3-num">3</div>
+                <div class="step-title">Upload Campaign CSV File</div>
+            </div>
+            <p class="text-sm text-muted mb-12">CSV must have <span class="tag tag-blue">EMAIL_ID</span> column + all dynamic fields from the template.</p>
+            <div class="file-drop" id="csv-drop" onclick="document.getElementById('csv-input').click()">
+                <input type="file" id="csv-input" accept=".csv" />
+                <div class="icon">&#128202;</div>
+                <p>Click or drag your CSV file here</p>
+            </div>
+            <div id="csv-result" class="hidden"></div>
+            <div id="csv-preview" class="hidden"></div>
+        </div>
+
+        <!-- ========== STEP 4: Configuration & Launch ========== -->
+        <div class="step disabled" id="step4">
+            <div class="step-header">
+                <div class="step-number" id="step4-num">4</div>
+                <div class="step-title">Configure &amp; Launch Campaign</div>
+            </div>
+            <div class="row">
+                <div>
+                    <label>From Email</label>
+                    <input type="email" id="cfg-from-email" value="consumer.notification@astraglobal.info" />
+                </div>
+                <div>
+                    <label>Unsubscribe Group ID</label>
+                    <input type="number" id="cfg-unsub-id" value="25279" />
+                </div>
+            </div>
+            <label>Subject Line Pattern (use %%field%% for dynamic values)</label>
+            <input type="text" id="cfg-subject" value="VALIDATION LETTER- %%First_Name%% %%Middle_Name%% %%Last_Name%%" />
+            <div class="row">
+                <div>
+                    <label>Emails per Minute (1-500, recommended: 60)</label>
+                    <input type="number" id="cfg-rate" value="60" min="1" max="500" />
+                </div>
+                <div>
+                    <label>Batch Size (pause every N emails)</label>
+                    <input type="number" id="cfg-batch-size" value="500" min="0" />
+                </div>
+            </div>
+            <div class="row">
+                <div>
+                    <label>Batch Pause (seconds)</label>
+                    <input type="number" id="cfg-batch-pause" value="10" min="0" />
+                </div>
+                <div>
+                    <label>Retry Count (for failed emails)</label>
+                    <input type="number" id="cfg-retry" value="3" min="1" max="10" />
+                </div>
+            </div>
+            <div id="eta-estimate" class="msg msg-info hidden"></div>
+            <div class="mt-16">
+                <button class="btn btn-success" onclick="launchCampaign()" id="launch-btn">&#9889; Launch Campaign</button>
+            </div>
+        </div>
+
+        <!-- ========== STEP 5: Live Progress Dashboard ========== -->
+        <div class="step hidden" id="step5">
+            <div class="step-header">
+                <div class="step-number done" id="step5-num">&#10003;</div>
+                <div class="step-title">Campaign Progress</div>
+                <span class="status-indicator status-running" id="campaign-status">Running</span>
+            </div>
+            <div id="campaign-id-display" class="text-sm text-muted mb-12"></div>
+            
+            <div class="progress-bar-container">
+                <div class="progress-bar">
+                    <div class="progress-sent" id="progress-sent-bar" style="width:0%"></div>
+                    <div class="progress-failed" id="progress-failed-bar" style="width:0%"></div>
+                </div>
+                <div class="progress-text" id="progress-text">0 / 0</div>
+            </div>
+            
+            <div class="progress-grid">
+                <div class="stat-card">
+                    <div class="stat-value" id="stat-sent" style="color:#4ade80">0</div>
+                    <div class="stat-label">Delivered</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="stat-failed" style="color:#f87171">0</div>
+                    <div class="stat-label">Failed</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="stat-rate">0</div>
+                    <div class="stat-label">Emails/Min</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="stat-eta">--</div>
+                    <div class="stat-label">ETA Remaining</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="stat-current">0</div>
+                    <div class="stat-label">Processing</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="stat-total">0</div>
+                    <div class="stat-label">Total</div>
+                </div>
+            </div>
+            
+            <div class="row mt-16">
+                <button class="btn btn-danger btn-sm" onclick="cancelCampaign()" id="cancel-btn">Cancel Campaign</button>
+            </div>
+            
+            <div id="error-section" class="hidden mt-16">
+                <p class="text-sm" style="color:#f87171; margin-bottom:8px;">Recent Errors:</p>
+                <div class="error-log" id="error-log"></div>
+            </div>
+            
+            <!-- Final summary (shown when campaign completes) -->
+            <div id="final-summary" class="hidden mt-16">
+                <div class="msg msg-success" id="final-msg"></div>
+                <div class="progress-grid mt-8">
+                    <div class="stat-card">
+                        <div class="stat-value" id="final-duration">--</div>
+                        <div class="stat-label">Duration</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value" id="final-rate">--</div>
+                        <div class="stat-label">Actual Rate/Min</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value" id="final-success" style="color:#4ade80">--%</div>
+                        <div class="stat-label">Success Rate</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ========== Campaign History ========== -->
+        <div class="step mt-16" id="history-section">
+            <div class="step-header">
+                <div class="step-title">&#128203; Campaign History</div>
+                <button class="btn btn-outline btn-sm" onclick="loadHistory()">Refresh</button>
+            </div>
+            <div id="history-list">
+                <p class="text-sm text-muted">Click refresh to load past campaigns from database.</p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    // ============================================================
+    // STATE
+    // ============================================================
+    let templateHTML = '';
+    let templateFields = [];
+    let csvDataJSON = '';
+    let csvRows = [];
+    let activeCampaignId = null;
+    let sseSource = null;  // Server-Sent Events connection
+
+    const API = '';  // Same origin
+
+    // ============================================================
+    // STEP 1: Template Upload
+    // ============================================================
+    document.getElementById('template-input').addEventListener('change', async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+
+        const formData = new FormData();
+        formData.append('template_file', file);
+
+        try {
+            const res = await fetch(`${API}/api/upload-template`, { method: 'POST', body: formData });
+            const data = await res.json();
+            
+            templateHTML = data.html_full;
+            templateFields = data.fields;
+            
+            document.getElementById('template-msg').textContent = 
+                `Template "${data.filename}" loaded. Found ${data.fields.length} dynamic fields.`;
+            
+            let fieldsHTML = '<div style="margin-top:8px">';
+            data.fields.forEach(f => {
+                fieldsHTML += `<span class="tag tag-blue">${f}</span>`;
+            });
+            fieldsHTML += '</div>';
+            document.getElementById('template-fields').innerHTML = fieldsHTML;
+            
+            document.getElementById('template-result').classList.remove('hidden');
+            document.getElementById('step1-num').classList.add('done');
+            document.getElementById('step1-num').textContent = '✓';
+            
+            // Enable Step 2
+            document.getElementById('step2').classList.remove('disabled');
+            buildTestFields();
+            
+            // Enable Step 3
+            document.getElementById('step3').classList.remove('disabled');
+            
+        } catch (err) {
+            alert('Error uploading template: ' + err.message);
+        }
+    });
+
+    // Drag-and-drop for template
+    ['template-drop', 'csv-drop'].forEach(id => {
+        const el = document.getElementById(id);
+        el.addEventListener('dragover', (e) => { e.preventDefault(); el.classList.add('dragover'); });
+        el.addEventListener('dragleave', () => el.classList.remove('dragover'));
+        el.addEventListener('drop', (e) => {
+            e.preventDefault();
+            el.classList.remove('dragover');
+            const inputId = id === 'template-drop' ? 'template-input' : 'csv-input';
+            const input = document.getElementById(inputId);
+            input.files = e.dataTransfer.files;
+            input.dispatchEvent(new Event('change'));
+        });
+    });
+
+    // ============================================================
+    // STEP 2: Test Email
+    // ============================================================
+    function buildTestFields() {
+        let html = '<div class="row" style="flex-wrap:wrap">';
+        templateFields.forEach(f => {
+            html += `<div style="min-width:180px">
+                <label>${f}</label>
+                <input type="text" id="test-field-${f}" value="${getDefaultTestValue(f)}" />
+            </div>`;
+        });
+        html += '</div>';
+        document.getElementById('test-fields-container').innerHTML = html;
+    }
+
+    function getDefaultTestValue(field) {
+        const defaults = {
+            'First_Name': 'John', 'Middle_Name': '', 'Last_Name': 'Doe',
+            'Street_Address': '123 Main St', 'City': 'Jacksonville', 'State': 'FL',
+            'Zip': '32202', 'Date': new Date().toLocaleDateString('en-US'),
+            'Astra_Reference_Number': 'TEST-001',
+            'ORIGINAL_CREDITOR_NAME': 'Test Creditor', 'ORIGINAL_CREDITOR_ACCOUNT': '12345',
+            'CURRENT_CREDITOR_NAME': 'Test Current', 'CURRENT_CREDITOR_ACCOUNT': '67890',
+            'ITEMIZATION_DATE': '01/01/2025', 'PRINCIPAL_BALANCE': '1000.00',
+            'CURRENTBAL': '1000.00', 'VALIDATION_END_DATE': '02/01/2025',
+            'Settlement_Amount': '500.00',
+        };
+        return defaults[field] || 'Test';
+    }
+
+    async function sendTestEmail() {
+        const toEmail = document.getElementById('test-to-email').value;
+        const fromEmail = document.getElementById('test-from-email').value;
+        const subject = document.getElementById('test-subject').value;
+        const unsubId = document.getElementById('test-unsub-id').value;
+
+        if (!toEmail) { alert('Please enter a test recipient email'); return; }
+
+        // Collect test field values
+        const testData = {};
+        templateFields.forEach(f => {
+            testData[f] = document.getElementById(`test-field-${f}`)?.value || '';
+        });
+
+        const formData = new FormData();
+        formData.append('to_email', toEmail);
+        formData.append('from_email', fromEmail);
+        formData.append('html_template', templateHTML);
+        formData.append('subject_pattern', subject);
+        formData.append('test_data', JSON.stringify(testData));
+        formData.append('unsubscribe_group_id', unsubId);
+
+        const resultDiv = document.getElementById('test-result');
+        resultDiv.classList.remove('hidden');
+        resultDiv.innerHTML = '<div class="msg msg-info">Sending test email...</div>';
+
+        try {
+            const res = await fetch(`${API}/api/send-test`, { method: 'POST', body: formData });
+            const data = await res.json();
+            
+            if (data.success) {
+                resultDiv.innerHTML = `<div class="msg msg-success">&#10003; ${data.message}</div>`;
+            } else {
+                resultDiv.innerHTML = `<div class="msg msg-error">&#10007; Failed: ${data.error || data.message}</div>`;
+            }
+        } catch (err) {
+            resultDiv.innerHTML = `<div class="msg msg-error">&#10007; Error: ${err.message}</div>`;
+        }
+    }
+
+    function skipTest() {
+        document.getElementById('step2-num').classList.add('done');
+        document.getElementById('step2-num').textContent = '✓';
+        document.getElementById('step3').classList.remove('disabled');
+        document.getElementById('step3').scrollIntoView({ behavior: 'smooth' });
+    }
+
+    // ============================================================
+    // STEP 3: CSV Upload & Validation
+    // ============================================================
+    document.getElementById('csv-input').addEventListener('change', async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+
+        const formData = new FormData();
+        formData.append('csv_file', file);
+        formData.append('template_fields', JSON.stringify(templateFields));
+
+        const resultDiv = document.getElementById('csv-result');
+        resultDiv.classList.remove('hidden');
+        resultDiv.innerHTML = '<div class="msg msg-info">Validating CSV...</div>';
+
+        try {
+            const res = await fetch(`${API}/api/validate-csv`, { method: 'POST', body: formData });
+            const data = await res.json();
+            
+            if (data.valid) {
+                csvDataJSON = data.csv_data_json;
+                csvRows = JSON.parse(csvDataJSON);
+                
+                resultDiv.innerHTML = `<div class="msg msg-success">&#10003; CSV valid! <strong>${data.total_rows}</strong> recipients found. All required fields matched.</div>`;
+                
+                // Show preview table
+                if (data.preview && data.preview.length > 0) {
+                    let tableHTML = '<div class="preview-table"><table><tr>';
+                    Object.keys(data.preview[0]).forEach(col => {
+                        tableHTML += `<th>${col}</th>`;
+                    });
+                    tableHTML += '</tr>';
+                    data.preview.forEach(row => {
+                        tableHTML += '<tr>';
+                        Object.values(row).forEach(val => {
+                            tableHTML += `<td>${val}</td>`;
+                        });
+                        tableHTML += '</tr>';
+                    });
+                    tableHTML += '</table></div>';
+                    document.getElementById('csv-preview').innerHTML = `<p class="text-sm text-muted mt-8">Preview (first 5 rows):</p>${tableHTML}`;
+                    document.getElementById('csv-preview').classList.remove('hidden');
+                }
+                
+                document.getElementById('step3-num').classList.add('done');
+                document.getElementById('step3-num').textContent = '✓';
+                
+                // Enable Step 4
+                document.getElementById('step4').classList.remove('disabled');
+                updateETA();
+                
+                // Also fill test fields with first row data
+                if (csvRows.length > 0) {
+                    templateFields.forEach(f => {
+                        const el = document.getElementById(`test-field-${f}`);
+                        if (el && csvRows[0][f] !== undefined) {
+                            el.value = csvRows[0][f];
+                        }
+                    });
+                }
+                
+            } else {
+                resultDiv.innerHTML = `<div class="msg msg-error">&#10007; ${data.error}</div>`;
+                if (data.missing_fields) {
+                    let html = '<div style="margin-top:8px">Missing: ';
+                    data.missing_fields.forEach(f => html += `<span class="tag tag-red">${f}</span>`);
+                    html += '</div>';
+                    resultDiv.innerHTML += html;
+                }
+                document.getElementById('csv-preview').classList.add('hidden');
+            }
+        } catch (err) {
+            resultDiv.innerHTML = `<div class="msg msg-error">&#10007; Error: ${err.message}</div>`;
+        }
+    });
+
+    // ============================================================
+    // STEP 4: Configuration & Launch
+    // ============================================================
+    function updateETA() {
+        const rate = parseInt(document.getElementById('cfg-rate').value) || 60;
+        const total = csvRows.length;
+        const batchSize = parseInt(document.getElementById('cfg-batch-size').value) || 500;
+        const batchPause = parseInt(document.getElementById('cfg-batch-pause').value) || 10;
+        
+        // Time for sending = total / rate minutes
+        let totalMinutes = total / rate;
+        // Add batch pauses
+        if (batchSize > 0) {
+            const batches = Math.floor(total / batchSize);
+            totalMinutes += (batches * batchPause) / 60;
+        }
+        
+        const hours = Math.floor(totalMinutes / 60);
+        const mins = Math.floor(totalMinutes % 60);
+        
+        const el = document.getElementById('eta-estimate');
+        el.classList.remove('hidden');
+        el.innerHTML = `&#9200; Estimated time for <strong>${total.toLocaleString()}</strong> emails at <strong>${rate}/min</strong>: <strong>${hours}h ${mins}m</strong>`;
+    }
+
+    // Re-calculate ETA when config changes
+    ['cfg-rate', 'cfg-batch-size', 'cfg-batch-pause'].forEach(id => {
+        document.getElementById(id).addEventListener('input', updateETA);
+    });
+
+    async function launchCampaign() {
+        if (!confirm(`Launch campaign to send ${csvRows.length.toLocaleString()} emails? This cannot be undone.`)) return;
+        
+        const btn = document.getElementById('launch-btn');
+        btn.disabled = true;
+        btn.textContent = 'Launching...';
+
+        const formData = new FormData();
+        formData.append('html_template', templateHTML);
+        formData.append('csv_data', csvDataJSON);
+        formData.append('from_email', document.getElementById('cfg-from-email').value);
+        formData.append('subject_pattern', document.getElementById('cfg-subject').value);
+        formData.append('unsubscribe_group_id', document.getElementById('cfg-unsub-id').value);
+        formData.append('rate_per_minute', document.getElementById('cfg-rate').value);
+        formData.append('batch_size', document.getElementById('cfg-batch-size').value);
+        formData.append('batch_pause_seconds', document.getElementById('cfg-batch-pause').value);
+        formData.append('retry_count', document.getElementById('cfg-retry').value);
+
+        try {
+            const res = await fetch(`${API}/api/start-campaign`, { method: 'POST', body: formData });
+            const data = await res.json();
+            
+            if (data.campaign_id) {
+                activeCampaignId = data.campaign_id;
+                
+                // Show progress dashboard
+                document.getElementById('step5').classList.remove('hidden');
+                document.getElementById('campaign-id-display').textContent = `Campaign ID: ${data.campaign_id}`;
+                document.getElementById('stat-total').textContent = data.total_emails.toLocaleString();
+                
+                // Start listening for real-time updates
+                startSSE(data.campaign_id);
+                
+                document.getElementById('step5').scrollIntoView({ behavior: 'smooth' });
+                
+                // Hide/disable earlier steps
+                document.getElementById('step4-num').classList.add('done');
+                document.getElementById('step4-num').textContent = '✓';
+            }
+        } catch (err) {
+            alert('Error starting campaign: ' + err.message);
+            btn.disabled = false;
+            btn.textContent = '⚡ Launch Campaign';
+        }
+    }
+
+    // ============================================================
+    // STEP 5: Live Progress via SSE
+    // ============================================================
+    function startSSE(campaignId) {
+        // Close any existing connection
+        if (sseSource) sseSource.close();
+        
+        // EventSource creates a persistent connection to the server
+        // The server pushes progress updates every 2 seconds
+        sseSource = new EventSource(`${API}/api/campaign/${campaignId}/stream`);
+        
+        sseSource.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            
+            if (data.status === 'not_found') {
+                sseSource.close();
+                return;
+            }
+            
+            updateProgressUI(data);
+            
+            if (data.status === 'completed' || data.status === 'cancelled') {
+                sseSource.close();
+                showFinalSummary(data);
+            }
+        };
+        
+        sseSource.onerror = () => {
+            // SSE will auto-reconnect. If connection lost, fall back to polling.
+            setTimeout(() => {
+                if (activeCampaignId) pollProgress(activeCampaignId);
+            }, 5000);
+        };
+    }
+
+    async function pollProgress(campaignId) {
+        try {
+            const res = await fetch(`${API}/api/campaign/${campaignId}/progress`);
+            const data = await res.json();
+            updateProgressUI(data);
+            
+            if (data.status !== 'completed' && data.status !== 'cancelled') {
+                setTimeout(() => pollProgress(campaignId), 3000);
+            } else {
+                showFinalSummary(data);
+            }
+        } catch (err) {
+            setTimeout(() => pollProgress(campaignId), 5000);
+        }
+    }
+
+    function updateProgressUI(data) {
+        const total = data.total || 1;
+        const sent = data.sent || 0;
+        const failed = data.failed || 0;
+        const processed = sent + failed;
+        
+        // Progress bar
+        const sentPct = (sent / total) * 100;
+        const failedPct = (failed / total) * 100;
+        document.getElementById('progress-sent-bar').style.width = sentPct + '%';
+        document.getElementById('progress-failed-bar').style.width = failedPct + '%';
+        document.getElementById('progress-text').textContent = `${processed.toLocaleString()} / ${total.toLocaleString()} (${Math.round(sentPct + failedPct)}%)`;
+        
+        // Stats
+        document.getElementById('stat-sent').textContent = sent.toLocaleString();
+        document.getElementById('stat-failed').textContent = failed.toLocaleString();
+        document.getElementById('stat-current').textContent = ((data.current_index || 0) + 1).toLocaleString();
+        document.getElementById('stat-total').textContent = total.toLocaleString();
+        
+        // Rate
+        if (data.avg_time_per_email && data.avg_time_per_email > 0) {
+            const actualRate = Math.round(60 / data.avg_time_per_email);
+            document.getElementById('stat-rate').textContent = actualRate;
+        }
+        
+        // ETA
+        document.getElementById('stat-eta').textContent = data.estimated_remaining || '--';
+        
+        // Status indicator
+        const statusEl = document.getElementById('campaign-status');
+        const statusText = data.status || 'unknown';
+        statusEl.textContent = statusText.charAt(0).toUpperCase() + statusText.slice(1);
+        statusEl.className = 'status-indicator';
+        if (statusText === 'completed') statusEl.classList.add('status-completed');
+        else if (statusText === 'cancelled') statusEl.classList.add('status-cancelled');
+        else if (statusText.includes('rate_limited') || statusText.includes('batch_pause')) {
+            statusEl.classList.add('status-running');
+            statusEl.textContent = statusText;
+        }
+        else statusEl.classList.add('status-running');
+        
+        // Errors
+        if (data.errors && data.errors.length > 0) {
+            document.getElementById('error-section').classList.remove('hidden');
+            const logEl = document.getElementById('error-log');
+            logEl.innerHTML = data.errors.slice(-20).map(e => 
+                `<div class="error-log-entry">#${e.index} ${e.email}: ${e.error}</div>`
+            ).join('');
+            logEl.scrollTop = logEl.scrollHeight;
+        }
+    }
+
+    function showFinalSummary(data) {
+        document.getElementById('cancel-btn').classList.add('hidden');
+        const summary = document.getElementById('final-summary');
+        summary.classList.remove('hidden');
+        
+        const status = data.status === 'completed' ? '&#10003; Campaign Completed!' : '&#9888; Campaign Cancelled';
+        document.getElementById('final-msg').innerHTML = `<strong>${status}</strong> &mdash; 
+            ${(data.sent || 0).toLocaleString()} delivered, ${(data.failed || 0).toLocaleString()} failed out of ${(data.total || 0).toLocaleString()} total.`;
+        
+        document.getElementById('final-duration').textContent = data.duration_human || '--';
+        document.getElementById('final-rate').textContent = data.actual_rate || '--';
+        document.getElementById('final-success').textContent = (data.success_percentage || 0) + '%';
+    }
+
+    async function cancelCampaign() {
+        if (!activeCampaignId) return;
+        if (!confirm('Are you sure you want to cancel? Emails already sent cannot be recalled.')) return;
+        
+        try {
+            await fetch(`${API}/api/campaign/${activeCampaignId}/cancel`, { method: 'POST' });
+        } catch (err) {
+            alert('Error cancelling: ' + err.message);
+        }
+    }
+
+    // ============================================================
+    // Campaign History
+    // ============================================================
+    async function loadHistory() {
+        try {
+            const res = await fetch(`${API}/api/campaigns`);
+            const campaigns = await res.json();
+            
+            const listEl = document.getElementById('history-list');
+            
+            if (!campaigns || campaigns.length === 0) {
+                listEl.innerHTML = '<p class="text-sm text-muted">No past campaigns found.</p>';
+                return;
+            }
+            
+            listEl.innerHTML = campaigns.map(c => `
+                <div class="history-card">
+                    <div>
+                        <strong>${c.id || c.campaign_id || 'Unknown'}</strong>
+                        <span class="tag ${c.status === 'completed' ? 'tag-green' : c.status === 'running' ? 'tag-blue' : 'tag-yellow'}">${c.status || 'unknown'}</span>
+                        <div class="meta">${c.from_email || ''} &bull; ${c.started_at ? new Date(c.started_at).toLocaleString() : ''}</div>
+                    </div>
+                    <div style="text-align:right">
+                        <div>${(c.sent_count || c.sent || 0).toLocaleString()} / ${(c.total_emails || c.total || 0).toLocaleString()} sent</div>
+                        <div class="meta">${c.failed_count || c.failed || 0} failed</div>
+                    </div>
+                </div>
+            `).join('');
+        } catch (err) {
+            document.getElementById('history-list').innerHTML = `<p class="text-sm" style="color:#f87171">Error loading history: ${err.message}</p>`;
+        }
+    }
+
+    // Load history on page load
+    loadHistory();
+    </script>
+</body>
+</html>
