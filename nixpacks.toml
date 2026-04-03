@@ -1,8 +1,11 @@
 [phases.setup]
-nixPkgs = ["python312"]
+nixPkgs = ["python312", "python312Packages.pip"]
 
 [phases.install]
-cmds = ["pip install -r requirements.txt"]
+cmds = ["python3.12 -m venv /opt/venv && /opt/venv/bin/pip install -r requirements.txt"]
+
+[variables]
+NIXPACKS_PATH = "/opt/venv/bin"
 
 [start]
-cmd = "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"
+cmd = "/opt/venv/bin/uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"
