@@ -50,8 +50,8 @@ if SUPABASE_URL and SUPABASE_KEY:
 
 # Jinja2 template engine configured to use %%field%% syntax (matching your existing templates)
 jinja_env = Environment(
-    variable_start_string='%%',
-    variable_end_string='%%',
+    variable_start_string='{{',
+    variable_end_string='}}',
 )
 
 # Configure logging
