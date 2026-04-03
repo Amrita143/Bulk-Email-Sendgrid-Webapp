@@ -9,7 +9,7 @@ Key concepts:
 - FastAPI: A modern Python web framework for building APIs
 - Background Tasks: Long-running email sending loops that run independently
 - SSE (Server-Sent Events): Real-time progress updates pushed to the browser
-- Supabase: Cloud database to store campaign data permanently
+- Supabase: Cloud database to store campaign data permanently (via REST API)
 """
 
 import os
@@ -31,7 +31,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from jinja2 import Environment
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail, Asm
-from supabase import create_client, Client
+import httpx
 import pandas as pd
 
 # ============================================================
@@ -43,16 +43,10 @@ SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")  # Use the "anon" or "service_role" key
 
-# Initialize Supabase client (our cloud database)
-supabase: Client = None
-if SUPABASE_URL and SUPABASE_KEY:
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-# Jinja2 template engine configured to use %%field%% syntax (matching your existing templates)
-jinja_env = Environment(
-    variable_start_string='{{',
-    variable_end_string='}}',
-)
+# Jinja2 template engine - supports BOTH %%field%% and {{field}} syntax
+# The regex in extract_template_fields auto-detects which one your template uses.
+# We create the right Jinja env based on the uploaded template.
+# Default uses %% %% to match your existing templates.
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -90,15 +84,51 @@ active_campaigns = {}
 # HELPER FUNCTIONS
 # ============================================================
 
-def extract_template_fields(html_content: str) -> list:
+def detect_template_syntax(html_content: str) -> str:
     """
-    Extract all %%field_name%% placeholders from an HTML template.
-    Returns a list of unique field names found in the template.
+    Auto-detect whether the template uses %%field%% or {{field}} syntax.
+    Returns 'percent' or 'curly'.
+    """
+    percent_matches = re.findall(r'%%\w+%%', html_content)
+    curly_matches = re.findall(r'\{\{\s*\w+\s*\}\}', html_content)
     
-    Example: "Hello %%First_Name%% %%Last_Name%%" -> ["First_Name", "Last_Name"]
+    if len(percent_matches) >= len(curly_matches):
+        return 'percent'
+    return 'curly'
+
+
+def get_jinja_env(syntax: str = 'percent') -> Environment:
     """
-    # Find all occurrences of %%...%% in the template
-    fields = re.findall(r'%%(\w+)%%', html_content)
+    Create a Jinja2 Environment matching the template syntax.
+    'percent' -> %%field%%  (your original templates)
+    'curly'   -> {{field}}  (standard Jinja2)
+    """
+    if syntax == 'curly':
+        return Environment()  # Default Jinja2 uses {{ }}
+    else:
+        return Environment(
+            variable_start_string='%%',
+            variable_end_string='%%',
+        )
+
+
+def extract_template_fields(html_content: str) -> tuple:
+    """
+    Extract all placeholder fields from an HTML template.
+    Auto-detects %%field%% or {{field}} syntax.
+    
+    Returns (list_of_field_names, syntax_type)
+    
+    Example: "Hello %%First_Name%%" -> (["First_Name"], "percent")
+    Example: "Hello {{First_Name}}" -> (["First_Name"], "curly")
+    """
+    syntax = detect_template_syntax(html_content)
+    
+    if syntax == 'curly':
+        fields = re.findall(r'\{\{\s*(\w+)\s*\}\}', html_content)
+    else:
+        fields = re.findall(r'%%(\w+)%%', html_content)
+    
     # Remove duplicates while preserving order
     seen = set()
     unique_fields = []
@@ -106,13 +136,13 @@ def extract_template_fields(html_content: str) -> list:
         if f not in seen:
             seen.add(f)
             unique_fields.append(f)
-    return unique_fields
+    return unique_fields, syntax
 
 
-def generate_subject_line(row: dict, subject_pattern: str) -> str:
+def generate_subject_line(row: dict, subject_pattern: str, jinja_env: Environment) -> str:
     """
-    Generate the email subject line by replacing %%field%% placeholders.
-    Default pattern: 'VALIDATION LETTER- %%First_Name%% %%Middle_Name%% %%Last_Name%%'
+    Generate the email subject line by replacing placeholders.
+    Works with both %%field%% and {{field}} syntax.
     """
     template = jinja_env.from_string(subject_pattern)
     rendered = template.render(**row)
@@ -120,34 +150,61 @@ def generate_subject_line(row: dict, subject_pattern: str) -> str:
     return ' '.join(rendered.split())
 
 
-async def save_campaign_to_db(campaign_data: dict):
+# ============================================================
+# SUPABASE REST API HELPERS (using httpx, no SDK needed)
+# ============================================================
+# Instead of the supabase Python SDK (which has version conflicts),
+# we call the Supabase REST API directly. It's just HTTP POST/PATCH.
+
+async def supabase_request(method: str, table: str, data: dict = None, params: dict = None) -> dict:
     """
-    Save campaign metadata and results to Supabase.
-    This is called when a campaign starts and when it finishes.
+    Make a direct REST API call to Supabase PostgREST.
+    
+    Supabase exposes a REST API at {SUPABASE_URL}/rest/v1/{table}
+    We authenticate with the API key in the headers.
     """
-    if not supabase:
-        logger.warning("Supabase not configured, skipping database save")
-        return
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return None
+    
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",  # Don't return data to save bandwidth
+    }
     
     try:
-        # Upsert = insert if new, update if exists (based on campaign_id)
-        supabase.table("campaigns").upsert(campaign_data).execute()
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            if method == "upsert":
+                headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
+                resp = await client.post(url, json=data, headers=headers)
+            elif method == "insert":
+                resp = await client.post(url, json=data, headers=headers)
+            elif method == "select":
+                headers.pop("Content-Type", None)
+                headers["Prefer"] = "return=representation"
+                resp = await client.get(url, headers=headers, params=params)
+                if resp.status_code == 200:
+                    return resp.json()
+            
+            if resp.status_code not in (200, 201, 204):
+                logger.error(f"Supabase {method} {table} failed: {resp.status_code} {resp.text}")
+                return None
+            return {"ok": True}
     except Exception as e:
-        logger.error(f"Failed to save campaign to database: {e}")
+        logger.error(f"Supabase request error: {e}")
+        return None
+
+
+async def save_campaign_to_db(campaign_data: dict):
+    """Save campaign metadata to Supabase via REST API (upsert)."""
+    await supabase_request("upsert", "campaigns", campaign_data)
 
 
 async def save_email_log(log_entry: dict):
-    """
-    Save individual email send result to Supabase.
-    Each row = one email attempt with status code, error message, timestamp.
-    """
-    if not supabase:
-        return
-    
-    try:
-        supabase.table("email_logs").insert(log_entry).execute()
-    except Exception as e:
-        logger.error(f"Failed to save email log: {e}")
+    """Save individual email send result to Supabase via REST API."""
+    await supabase_request("insert", "email_logs", log_entry)
 
 
 # ============================================================
@@ -178,6 +235,10 @@ async def run_campaign(campaign_id: str, config: dict):
     
     # Initialize the SendGrid client (the service that actually delivers emails)
     sg = SendGridAPIClient(SENDGRID_API_KEY)
+    
+    # Create the right Jinja env for this template's syntax
+    template_syntax = config.get("template_syntax", "percent")
+    jinja_env = get_jinja_env(template_syntax)
     template = jinja_env.from_string(config["html_template"])
     
     total = len(config["csv_data"])
@@ -273,7 +334,7 @@ async def run_campaign(campaign_id: str, config: dict):
             continue
         
         # Generate subject line
-        subject = generate_subject_line(clean_row, config["subject_pattern"])
+        subject = generate_subject_line(clean_row, config["subject_pattern"], jinja_env)
         
         # Build the SendGrid email message
         message = Mail(
@@ -437,15 +498,20 @@ async def serve_frontend():
 async def upload_template(template_file: UploadFile = File(...)):
     """
     Upload an HTML email template.
-    Returns the list of dynamic fields (%%field%%) found in it.
+    Returns the list of dynamic fields found in it + detected syntax.
+    Auto-detects %%field%% vs {{field}} syntax.
     """
     content = await template_file.read()
     html_content = content.decode("utf-8")
-    fields = extract_template_fields(html_content)
+    fields, syntax = extract_template_fields(html_content)
+    
+    syntax_display = "%%field%%" if syntax == "percent" else "{{field}}"
     
     return {
         "filename": template_file.filename,
         "fields": fields,
+        "syntax": syntax,
+        "syntax_display": syntax_display,
         "html_preview": html_content[:500] + "..." if len(html_content) > 500 else html_content,
         "html_full": html_content,
     }
@@ -519,6 +585,7 @@ async def send_test_email(
     subject_pattern: str = Form(...),
     test_data: str = Form(...),  # JSON string of field values for test
     unsubscribe_group_id: int = Form(25279),
+    template_syntax: str = Form("percent"),  # "percent" or "curly"
 ):
     """
     Send a single test email to verify the template looks correct
@@ -531,12 +598,15 @@ async def send_test_email(
         # Parse test data
         data = json.loads(test_data)
         
+        # Create the right Jinja env for this template
+        jinja_env = get_jinja_env(template_syntax)
+        
         # Render template
         template = jinja_env.from_string(html_template)
         html_content = template.render(**data)
         
         # Generate subject
-        subject = generate_subject_line(data, subject_pattern)
+        subject = generate_subject_line(data, subject_pattern, jinja_env)
         
         # Send via SendGrid
         message = Mail(
@@ -576,6 +646,7 @@ async def start_campaign(
     batch_size: int = Form(500),         # Pause every 500 emails
     batch_pause_seconds: int = Form(10), # Pause for 10 seconds between batches
     retry_count: int = Form(3),          # Retry failed emails 3 times
+    template_syntax: str = Form("percent"),  # "percent" for %%field%%, "curly" for {{field}}
 ):
     """
     Start a new email campaign as a background task.
@@ -612,6 +683,7 @@ async def start_campaign(
         "batch_size": batch_size,
         "batch_pause_seconds": batch_pause_seconds,
         "retry_count": retry_count,
+        "template_syntax": template_syntax,
     }
     
     # Launch the campaign as a background task
@@ -637,11 +709,14 @@ async def get_campaign_progress(campaign_id: str):
         return active_campaigns[campaign_id]
     
     # If not in memory, check database (campaign may have finished before server restart)
-    if supabase:
+    if SUPABASE_URL and SUPABASE_KEY:
         try:
-            result = supabase.table("campaigns").select("*").eq("id", campaign_id).execute()
-            if result.data:
-                return result.data[0]
+            result = await supabase_request("select", "campaigns", params={
+                "id": f"eq.{campaign_id}",
+                "limit": "1",
+            })
+            if result and isinstance(result, list) and len(result) > 0:
+                return result[0]
         except Exception as e:
             logger.error(f"Database query error: {e}")
     
@@ -699,13 +774,18 @@ async def cancel_campaign(campaign_id: str):
 @app.get("/api/campaigns")
 async def list_campaigns():
     """List all campaigns from database (for history view)."""
-    if not supabase:
-        # Return from memory if no database
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        # Return from memory if no database configured
         return list(active_campaigns.values())
     
     try:
-        result = supabase.table("campaigns").select("*").order("started_at", desc=True).limit(50).execute()
-        return result.data
+        result = await supabase_request("select", "campaigns", params={
+            "order": "started_at.desc",
+            "limit": "50",
+        })
+        if result and isinstance(result, list):
+            return result
+        return list(active_campaigns.values())
     except Exception as e:
         logger.error(f"Failed to list campaigns: {e}")
         return list(active_campaigns.values())
@@ -714,19 +794,17 @@ async def list_campaigns():
 @app.get("/api/campaign/{campaign_id}/logs")
 async def get_campaign_logs(campaign_id: str, limit: int = 100, offset: int = 0):
     """Get detailed email logs for a specific campaign from database."""
-    if not supabase:
+    if not SUPABASE_URL or not SUPABASE_KEY:
         raise HTTPException(status_code=503, detail="Database not configured")
     
     try:
-        result = (
-            supabase.table("email_logs")
-            .select("*")
-            .eq("campaign_id", campaign_id)
-            .order("email_index")
-            .range(offset, offset + limit - 1)
-            .execute()
-        )
-        return {"logs": result.data, "offset": offset, "limit": limit}
+        result = await supabase_request("select", "email_logs", params={
+            "campaign_id": f"eq.{campaign_id}",
+            "order": "email_index",
+            "limit": str(limit),
+            "offset": str(offset),
+        })
+        return {"logs": result if isinstance(result, list) else [], "offset": offset, "limit": limit}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -737,7 +815,7 @@ async def health_check():
     return {
         "status": "healthy",
         "sendgrid_configured": bool(SENDGRID_API_KEY),
-        "supabase_configured": bool(supabase),
+        "supabase_configured": bool(SUPABASE_URL and SUPABASE_KEY),
         "active_campaigns": len(active_campaigns),
     }
 

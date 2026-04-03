@@ -313,6 +313,7 @@
     // ============================================================
     let templateHTML = '';
     let templateFields = [];
+    let templateSyntax = 'percent';  // Auto-detected: 'percent' for %%field%%, 'curly' for {{field}}
     let csvDataJSON = '';
     let csvRows = [];
     let activeCampaignId = null;
@@ -336,9 +337,10 @@
             
             templateHTML = data.html_full;
             templateFields = data.fields;
+            templateSyntax = data.syntax || 'percent';
             
             document.getElementById('template-msg').textContent = 
-                `Template "${data.filename}" loaded. Found ${data.fields.length} dynamic fields.`;
+                `Template "${data.filename}" loaded. Found ${data.fields.length} dynamic fields. Syntax: ${data.syntax_display || '%%field%%'}`;
             
             let fieldsHTML = '<div style="margin-top:8px">';
             data.fields.forEach(f => {
@@ -429,6 +431,7 @@
         formData.append('subject_pattern', subject);
         formData.append('test_data', JSON.stringify(testData));
         formData.append('unsubscribe_group_id', unsubId);
+        formData.append('template_syntax', templateSyntax);
 
         const resultDiv = document.getElementById('test-result');
         resultDiv.classList.remove('hidden');
@@ -578,6 +581,7 @@
         formData.append('batch_size', document.getElementById('cfg-batch-size').value);
         formData.append('batch_pause_seconds', document.getElementById('cfg-batch-pause').value);
         formData.append('retry_count', document.getElementById('cfg-retry').value);
+        formData.append('template_syntax', templateSyntax);
 
         try {
             const res = await fetch(`${API}/api/start-campaign`, { method: 'POST', body: formData });
