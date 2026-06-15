@@ -21,7 +21,8 @@ import time
 import uuid
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from email.utils import parseaddr
 from typing import Optional
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
@@ -42,6 +43,9 @@ import pandas as pd
 SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")  # Use the "anon" or "service_role" key
+EMAIL_QUEUE_ENABLED = os.environ.get("EMAIL_QUEUE_ENABLED", "false").lower() == "true"
+QUEUE_WORKER_ID = os.environ.get("QUEUE_WORKER_ID", f"worker-{uuid.uuid4().hex[:8]}")
+QUEUE_BATCH_SIZE = int(os.environ.get("QUEUE_BATCH_SIZE", "10"))
 
 # Jinja2 template engine - supports BOTH %%field%% and {{field}} syntax
 # The regex in extract_template_fields auto-detects which one your template uses.
@@ -150,6 +154,118 @@ def generate_subject_line(row: dict, subject_pattern: str, jinja_env: Environmen
     return ' '.join(rendered.split())
 
 
+def clean_csv_row(row: dict) -> dict:
+    """Normalize CSV row values before templating and sending."""
+    clean_row = {}
+    for key, value in row.items():
+        key = key.strip()
+        if pd.isna(value) if not isinstance(value, str) else False:
+            clean_row[key] = ""
+        else:
+            clean_row[key] = str(value)
+    return clean_row
+
+
+def validate_email_address(email: str) -> tuple[bool, str]:
+    """
+    Validate a recipient address before SendGrid's helper classes see it.
+
+    This intentionally rejects common CSV typos like "gmail,com" so one bad
+    record becomes a row failure instead of crashing the campaign task.
+    """
+    email = (email or "").strip()
+    if not email:
+        return False, "No EMAIL_ID found in row"
+
+    _, parsed = parseaddr(email)
+    if parsed != email:
+        return False, "Invalid email format"
+
+    if "," in email or ".." in email:
+        return False, "Invalid email format"
+
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        return False, "Invalid email format"
+
+    return True, ""
+
+
+def append_progress_error(progress: dict, error_entry: dict):
+    """Track recent errors in memory without letting the list grow forever."""
+    progress["errors"].append(error_entry)
+    if len(progress["errors"]) > 100:
+        progress["errors"] = progress["errors"][-100:]
+
+
+def normalize_campaign_record(record: dict) -> dict:
+    """Return DB campaign records in the same shape as live progress."""
+    if "total" in record:
+        return record
+
+    total = record.get("total_emails") or 0
+    sent = record.get("sent_count") or 0
+    failed = record.get("failed_count") or 0
+    normalized = dict(record)
+    normalized.update({
+        "campaign_id": record.get("id") or record.get("campaign_id"),
+        "total": total,
+        "sent": sent,
+        "failed": failed,
+        "current_index": min(sent + failed, total),
+        "errors": record.get("errors") or [],
+        "estimated_remaining": "calculating..." if record.get("status") in {"queued", "running"} else "0h 0m 0s",
+    })
+    return normalized
+
+
+async def record_email_result(
+    campaign_id: str,
+    email_index: int,
+    to_email: str,
+    success: bool,
+    status_code: int = 0,
+    error_message: Optional[str] = None,
+):
+    """Persist an email result using the current email_logs schema."""
+    await save_email_log({
+        "campaign_id": campaign_id,
+        "email_index": email_index,
+        "to_email": to_email,
+        "status_code": status_code if success else 0,
+        "success": success,
+        "error_message": error_message if not success else None,
+        "sent_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+async def record_row_failure(
+    campaign_id: str,
+    progress: dict,
+    email_index: int,
+    to_email: str,
+    error_message: str,
+    status_code: int = 0,
+):
+    """Mark one row failed and continue the campaign."""
+    progress["failed"] += 1
+    error_entry = {
+        "index": email_index,
+        "email": to_email or "EMPTY",
+        "error": error_message,
+        "status_code": status_code,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    append_progress_error(progress, error_entry)
+    asyncio.create_task(record_email_result(
+        campaign_id=campaign_id,
+        email_index=email_index,
+        to_email=to_email or "EMPTY",
+        success=False,
+        status_code=status_code,
+        error_message=error_message,
+    ))
+
+
 # ============================================================
 # SUPABASE REST API HELPERS (using httpx, no SDK needed)
 # ============================================================
@@ -181,6 +297,8 @@ async def supabase_request(method: str, table: str, data: dict = None, params: d
                 resp = await client.post(url, json=data, headers=headers)
             elif method == "insert":
                 resp = await client.post(url, json=data, headers=headers)
+            elif method == "patch":
+                resp = await client.patch(url, json=data, headers=headers, params=params)
             elif method == "select":
                 headers.pop("Content-Type", None)
                 headers["Prefer"] = "return=representation"
@@ -197,6 +315,33 @@ async def supabase_request(method: str, table: str, data: dict = None, params: d
         return None
 
 
+async def supabase_rpc(function_name: str, data: dict = None) -> Optional[dict]:
+    """Call a Supabase Postgres function via REST RPC."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return None
+
+    url = f"{SUPABASE_URL}/rest/v1/rpc/{function_name}"
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(url, json=data or {}, headers=headers)
+            if resp.status_code not in (200, 201, 204):
+                logger.error(f"Supabase RPC {function_name} failed: {resp.status_code} {resp.text}")
+                return None
+            if resp.status_code == 204 or not resp.text:
+                return {"ok": True}
+            return resp.json()
+    except Exception as e:
+        logger.error(f"Supabase RPC error: {e}")
+        return None
+
+
 async def save_campaign_to_db(campaign_data: dict):
     """Save campaign metadata to Supabase via REST API (upsert)."""
     await supabase_request("upsert", "campaigns", campaign_data)
@@ -205,6 +350,266 @@ async def save_campaign_to_db(campaign_data: dict):
 async def save_email_log(log_entry: dict):
     """Save individual email send result to Supabase via REST API."""
     await supabase_request("insert", "email_logs", log_entry)
+
+
+def queue_mode_available() -> bool:
+    """Queue mode is opt-in and requires Supabase."""
+    return EMAIL_QUEUE_ENABLED and bool(SUPABASE_URL and SUPABASE_KEY)
+
+
+def build_campaign_config(config: dict, include_template: bool = False) -> dict:
+    """Serialize campaign settings for persistence."""
+    persisted_config = {
+        "batch_size": config.get("batch_size", 500),
+        "batch_pause": config.get("batch_pause_seconds", 10),
+        "retry_count": config.get("retry_count", 3),
+        "unsubscribe_group_id": config.get("unsubscribe_group_id", 25279),
+        "template_syntax": config.get("template_syntax", "percent"),
+        "queue_enabled": include_template,
+    }
+    if include_template:
+        persisted_config.update({
+            "html_template": config["html_template"],
+            "from_email": config["from_email"],
+            "subject_pattern": config["subject_pattern"],
+            "rate_per_minute": config.get("rate_per_minute", 60),
+        })
+    return persisted_config
+
+
+async def enqueue_campaign_jobs(campaign_id: str, rows: list[dict], max_attempts: int) -> bool:
+    """Insert one durable queue row per CSV record."""
+    jobs = []
+    now = datetime.now(timezone.utc).isoformat()
+    for i, row in enumerate(rows):
+        clean_row = clean_csv_row(row)
+        jobs.append({
+            "campaign_id": campaign_id,
+            "email_index": i,
+            "to_email": clean_row.get("EMAIL_ID", "").strip(),
+            "row_data": clean_row,
+            "status": "queued",
+            "attempt_count": 0,
+            "max_attempts": max_attempts,
+            "next_attempt_at": now,
+        })
+
+    batch_size = 500
+    for start in range(0, len(jobs), batch_size):
+        result = await supabase_request("insert", "email_jobs", jobs[start:start + batch_size])
+        if not result:
+            return False
+    return True
+
+
+async def claim_due_email_jobs(limit: int = QUEUE_BATCH_SIZE) -> list[dict]:
+    """
+    Claim due jobs for this worker.
+
+    The Supabase migration will create this RPC using FOR UPDATE SKIP LOCKED so
+    multiple Railway workers can process safely without double-sending.
+    """
+    result = await supabase_rpc("claim_due_email_jobs", {
+        "p_worker_id": QUEUE_WORKER_ID,
+        "p_limit": limit,
+        "p_lock_seconds": 300,
+    })
+    return result if isinstance(result, list) else []
+
+
+async def mark_email_job_sent(job_id: str, status_code: int):
+    await supabase_request("patch", "email_jobs", {
+        "status": "sent",
+        "last_status_code": status_code,
+        "last_error_type": None,
+        "last_error_message": None,
+        "sent_at": datetime.now(timezone.utc).isoformat(),
+        "locked_by": None,
+        "locked_until": None,
+    }, params={"id": f"eq.{job_id}"})
+
+
+def retry_delay_seconds(attempt_count: int, status_code: int = 0) -> int:
+    if status_code == 429:
+        return 90
+    delays = [60, 300, 900]
+    return delays[min(max(attempt_count - 1, 0), len(delays) - 1)]
+
+
+def is_permanent_email_failure(error_type: str, status_code: int = 0) -> bool:
+    if error_type in {"invalid_email", "template_error", "message_build_error"}:
+        return True
+    return status_code in {400, 401, 403}
+
+
+async def schedule_email_job_retry(job: dict, error_type: str, error_message: str, status_code: int = 0):
+    attempt_count = int(job.get("attempt_count") or 0) + 1
+    max_attempts = int(job.get("max_attempts") or 3)
+
+    if attempt_count >= max_attempts or is_permanent_email_failure(error_type, status_code):
+        await move_email_job_to_dead_letter(job, error_type, error_message, status_code, attempt_count)
+        return
+
+    next_attempt_at = datetime.now(timezone.utc) + timedelta(seconds=retry_delay_seconds(attempt_count, status_code))
+    await supabase_request("patch", "email_jobs", {
+        "status": "retry_scheduled",
+        "attempt_count": attempt_count,
+        "next_attempt_at": next_attempt_at.isoformat(),
+        "last_status_code": status_code,
+        "last_error_type": error_type,
+        "last_error_message": error_message[:2000],
+        "last_attempt_at": datetime.now(timezone.utc).isoformat(),
+        "locked_by": None,
+        "locked_until": None,
+    }, params={"id": f"eq.{job['id']}"})
+
+
+async def move_email_job_to_dead_letter(
+    job: dict,
+    error_type: str,
+    error_message: str,
+    status_code: int = 0,
+    attempt_count: Optional[int] = None,
+):
+    attempt_count = attempt_count if attempt_count is not None else int(job.get("attempt_count") or 0) + 1
+    await supabase_request("insert", "email_dead_letters", {
+        "campaign_id": job["campaign_id"],
+        "email_job_id": job["id"],
+        "email_index": job["email_index"],
+        "to_email": job.get("to_email") or "",
+        "row_data": job.get("row_data") or {},
+        "final_status_code": status_code,
+        "error_type": error_type,
+        "error_message": error_message[:2000],
+        "attempt_count": attempt_count,
+    })
+    await supabase_request("patch", "email_jobs", {
+        "status": "dead_lettered",
+        "attempt_count": attempt_count,
+        "last_status_code": status_code,
+        "last_error_type": error_type,
+        "last_error_message": error_message[:2000],
+        "last_attempt_at": datetime.now(timezone.utc).isoformat(),
+        "locked_by": None,
+        "locked_until": None,
+    }, params={"id": f"eq.{job['id']}"})
+
+
+async def load_campaign_config(campaign_id: str) -> Optional[dict]:
+    result = await supabase_request("select", "campaigns", params={
+        "id": f"eq.{campaign_id}",
+        "limit": "1",
+    })
+    if not result or not isinstance(result, list):
+        return None
+
+    raw_config = result[0].get("config_json") or "{}"
+    try:
+        return json.loads(raw_config)
+    except json.JSONDecodeError:
+        logger.error(f"Campaign {campaign_id} has invalid config_json")
+        return None
+
+
+async def refresh_campaign_counts(campaign_id: str):
+    """Let the DB aggregate queue state into the campaigns table."""
+    await supabase_rpc("refresh_campaign_counts", {"p_campaign_id": campaign_id})
+
+
+async def process_email_job(job: dict, sg: SendGridAPIClient) -> None:
+    campaign_id = job["campaign_id"]
+    email_index = int(job["email_index"])
+    to_email = (job.get("to_email") or "").strip()
+    row_data = job.get("row_data") or {}
+    attempt_number = int(job.get("attempt_count") or 0) + 1
+
+    is_valid, validation_error = validate_email_address(to_email)
+    if not is_valid:
+        await record_email_result(campaign_id, email_index, to_email or "EMPTY", False, 0, validation_error)
+        await move_email_job_to_dead_letter(job, "invalid_email", validation_error, 0, attempt_number)
+        await refresh_campaign_counts(campaign_id)
+        return
+
+    config = await load_campaign_config(campaign_id)
+    if not config:
+        await schedule_email_job_retry(job, "campaign_config_error", "Campaign config not found", 0)
+        await refresh_campaign_counts(campaign_id)
+        return
+
+    try:
+        jinja_env = get_jinja_env(config.get("template_syntax", "percent"))
+        template = jinja_env.from_string(config["html_template"])
+        html_content = template.render(**row_data)
+        subject = generate_subject_line(row_data, config["subject_pattern"], jinja_env)
+    except Exception as e:
+        error_message = f"Template render error: {str(e)}"
+        await record_email_result(campaign_id, email_index, to_email, False, 0, error_message)
+        await move_email_job_to_dead_letter(job, "template_error", error_message, 0, attempt_number)
+        await refresh_campaign_counts(campaign_id)
+        return
+
+    try:
+        message = Mail(
+            from_email=config["from_email"],
+            to_emails=to_email,
+            subject=subject,
+            html_content=html_content,
+        )
+
+        unsubscribe_group_id = config.get("unsubscribe_group_id")
+        if unsubscribe_group_id:
+            message.asm = Asm(group_id=int(unsubscribe_group_id))
+    except Exception as e:
+        error_message = f"Message build error: {str(e)}"
+        await record_email_result(campaign_id, email_index, to_email, False, 0, error_message)
+        await move_email_job_to_dead_letter(job, "message_build_error", error_message, 0, attempt_number)
+        await refresh_campaign_counts(campaign_id)
+        return
+
+    status_code = 0
+    try:
+        response = sg.send(message)
+        status_code = response.status_code
+        if status_code == 202:
+            await mark_email_job_sent(job["id"], status_code)
+            await record_email_result(campaign_id, email_index, to_email, True, status_code)
+        else:
+            error_message = f"SendGrid returned status {status_code}"
+            await record_email_result(campaign_id, email_index, to_email, False, status_code, error_message)
+            await schedule_email_job_retry(job, "sendgrid_status", error_message, status_code)
+    except Exception as e:
+        error_message = str(e)
+        await record_email_result(campaign_id, email_index, to_email, False, status_code, error_message)
+        await schedule_email_job_retry(job, "sendgrid_exception", error_message, status_code)
+
+    await refresh_campaign_counts(campaign_id)
+
+
+async def run_queue_worker(poll_interval: int = 5):
+    """Run a durable Supabase-backed email worker."""
+    if not SENDGRID_API_KEY:
+        raise RuntimeError("SendGrid API key not configured")
+    if not queue_mode_available():
+        raise RuntimeError("Queue worker requires EMAIL_QUEUE_ENABLED=true and Supabase credentials")
+
+    logger.info(f"Starting queue worker {QUEUE_WORKER_ID}")
+    sg = SendGridAPIClient(SENDGRID_API_KEY)
+
+    while True:
+        jobs = await claim_due_email_jobs(QUEUE_BATCH_SIZE)
+        if not jobs:
+            await asyncio.sleep(poll_interval)
+            continue
+
+        for job in jobs:
+            try:
+                await process_email_job(job, sg)
+                config = await load_campaign_config(job["campaign_id"])
+                rate_per_minute = int((config or {}).get("rate_per_minute") or 60)
+                await asyncio.sleep(max(0.0, 60.0 / max(rate_per_minute, 1)))
+            except Exception as e:
+                logger.exception(f"Worker failed processing job {job.get('id')}: {e}")
+                await schedule_email_job_retry(job, "worker_exception", str(e), 0)
 
 
 # ============================================================
@@ -280,12 +685,7 @@ async def run_campaign(campaign_id: str, config: dict):
         "subject_pattern": config["subject_pattern"],
         "rate_per_minute": rate_per_minute,
         "started_at": progress["started_at"],
-        "config_json": json.dumps({
-            "batch_size": batch_size,
-            "batch_pause": batch_pause,
-            "retry_count": retry_count,
-            "unsubscribe_group_id": unsubscribe_group_id,
-        }),
+        "config_json": json.dumps(build_campaign_config(config, include_template=False)),
     })
     
     send_times = []  # Track time taken for each email (for ETA calculation)
@@ -299,112 +699,109 @@ async def run_campaign(campaign_id: str, config: dict):
         progress["current_index"] = i
         email_start_time = time.time()
         
-        # Prepare the row data: replace NaN/None with empty string
-        clean_row = {}
-        for key, value in row.items():
-            key = key.strip()  # Remove whitespace from column names
-            if pd.isna(value) if not isinstance(value, str) else False:
-                clean_row[key] = ""
-            else:
-                clean_row[key] = str(value)
-        
-        consumer_email = clean_row.get("EMAIL_ID", "").strip()
-        
-        if not consumer_email:
-            progress["failed"] += 1
-            progress["errors"].append({
-                "index": i,
-                "email": "EMPTY",
-                "error": "No EMAIL_ID found in row",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            })
-            continue
-        
-        # Render the HTML template with this row's data
+        consumer_email = "EMPTY"
+
         try:
-            html_content = template.render(**clean_row)
+            clean_row = clean_csv_row(row)
+            consumer_email = clean_row.get("EMAIL_ID", "").strip()
+
+            is_valid_email, validation_error = validate_email_address(consumer_email)
+            if not is_valid_email:
+                await record_row_failure(campaign_id, progress, i, consumer_email, validation_error)
+            else:
+                # Render the HTML template with this row's data
+                try:
+                    html_content = template.render(**clean_row)
+                    subject = generate_subject_line(clean_row, config["subject_pattern"], jinja_env)
+                except Exception as e:
+                    await record_row_failure(
+                        campaign_id,
+                        progress,
+                        i,
+                        consumer_email,
+                        f"Template render error: {str(e)}",
+                    )
+                    html_content = None
+                    subject = None
+
+                if html_content is not None and subject is not None:
+                    try:
+                        message = Mail(
+                            from_email=config["from_email"],
+                            to_emails=consumer_email,
+                            subject=subject,
+                            html_content=html_content,
+                        )
+
+                        if unsubscribe_group_id:
+                            asm = Asm(group_id=int(unsubscribe_group_id))
+                            message.asm = asm
+                    except Exception as e:
+                        await record_row_failure(
+                            campaign_id,
+                            progress,
+                            i,
+                            consumer_email,
+                            f"Message build error: {str(e)}",
+                        )
+                        message = None
+
+                    if message is not None:
+                        send_success = False
+                        last_error = ""
+                        status_code = 0
+
+                        for attempt in range(retry_count):
+                            try:
+                                response = sg.send(message)
+                                status_code = response.status_code
+
+                                if status_code == 202:
+                                    # 202 = SendGrid accepted the email for delivery
+                                    send_success = True
+                                    break
+                                elif status_code == 429:
+                                    # 429 = Rate limit hit. Wait and retry.
+                                    wait_time = 60
+                                    logger.warning(f"Rate limit hit at index {i}. Waiting {wait_time}s...")
+                                    progress["status"] = f"rate_limited (waiting {wait_time}s)"
+                                    await asyncio.sleep(wait_time)
+                                    progress["status"] = "running"
+                                else:
+                                    last_error = f"Status {status_code}"
+
+                            except Exception as e:
+                                last_error = str(e)
+                                if attempt < retry_count - 1:
+                                    await asyncio.sleep(5)
+
+                        if send_success:
+                            progress["sent"] += 1
+                            asyncio.create_task(record_email_result(
+                                campaign_id=campaign_id,
+                                email_index=i,
+                                to_email=consumer_email,
+                                success=True,
+                                status_code=status_code,
+                            ))
+                        else:
+                            await record_row_failure(
+                                campaign_id,
+                                progress,
+                                i,
+                                consumer_email,
+                                last_error or f"Status {status_code}",
+                                status_code,
+                            )
         except Exception as e:
-            progress["failed"] += 1
-            progress["errors"].append({
-                "index": i,
-                "email": consumer_email,
-                "error": f"Template render error: {str(e)}",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            })
-            continue
-        
-        # Generate subject line
-        subject = generate_subject_line(clean_row, config["subject_pattern"], jinja_env)
-        
-        # Build the SendGrid email message
-        message = Mail(
-            from_email=config["from_email"],
-            to_emails=consumer_email,
-            subject=subject,
-            html_content=html_content,
-        )
-        
-        # Add unsubscribe group (required for compliance)
-        if unsubscribe_group_id:
-            asm = Asm(group_id=int(unsubscribe_group_id))
-            message.asm = asm
-        
-        # Try to send with retries
-        send_success = False
-        last_error = ""
-        status_code = 0
-        
-        for attempt in range(retry_count):
-            try:
-                response = sg.send(message)
-                status_code = response.status_code
-                
-                if status_code == 202:
-                    # 202 = SendGrid accepted the email for delivery
-                    send_success = True
-                    break
-                elif status_code == 429:
-                    # 429 = Rate limit hit. Wait and retry.
-                    wait_time = 60  # Wait 60 seconds
-                    logger.warning(f"Rate limit hit at index {i}. Waiting {wait_time}s...")
-                    progress["status"] = f"rate_limited (waiting {wait_time}s)"
-                    await asyncio.sleep(wait_time)
-                    progress["status"] = "running"
-                else:
-                    last_error = f"Status {status_code}"
-                    
-            except Exception as e:
-                last_error = str(e)
-                # Wait before retry on network errors
-                if attempt < retry_count - 1:
-                    await asyncio.sleep(5)
-        
-        if send_success:
-            progress["sent"] += 1
-        else:
-            progress["failed"] += 1
-            error_entry = {
-                "index": i,
-                "email": consumer_email,
-                "error": last_error,
-                "status_code": status_code,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-            progress["errors"].append(error_entry)
-            # Keep only last 100 errors in memory
-            if len(progress["errors"]) > 100:
-                progress["errors"] = progress["errors"][-100:]
-        
-        # Save individual email log to database (async, don't wait)
-        asyncio.create_task(save_email_log({
-            "campaign_id": campaign_id,
-            "email_index": i,
-            "to_email": consumer_email,
-            "status_code": status_code if send_success else 0,
-            "success": send_success,
-            "error_message": last_error if not send_success else None,
-            "sent_at": datetime.now(timezone.utc).isoformat(),
-        }))
+            logger.exception(f"Unexpected row error in campaign {campaign_id} at index {i}: {e}")
+            await record_row_failure(
+                campaign_id,
+                progress,
+                i,
+                consumer_email,
+                f"Unexpected row error: {str(e)}",
+            )
         
         # Calculate timing statistics
         elapsed = time.time() - email_start_time
@@ -532,7 +929,13 @@ async def validate_csv(
     csv_text = content.decode("utf-8")
     
     # Parse CSV
-    df = pd.read_csv(io.StringIO(csv_text))
+    try:
+        df = pd.read_csv(io.StringIO(csv_text))
+    except Exception as e:
+        return {
+            "valid": False,
+            "error": f"CSV could not be parsed. Check for stray commas or broken rows. Details: {str(e)}",
+        }
     # Strip whitespace from column names (common issue)
     df.columns = df.columns.str.strip()
     
@@ -564,6 +967,33 @@ async def validate_csv(
             "required_fields": required_fields,
         }
     
+    invalid_email_rows = []
+    for index, email in enumerate(df["EMAIL_ID"].fillna("").astype(str)):
+        is_valid_email, validation_error = validate_email_address(email)
+        if not is_valid_email:
+            invalid_email_rows.append({
+                "row_number": index + 2,  # Header is row 1 in the uploaded CSV.
+                "email": email,
+                "error": validation_error,
+            })
+
+    if invalid_email_rows:
+        examples = "; ".join(
+            f"row {item['row_number']}: {item['email'] or 'EMPTY'}"
+            for item in invalid_email_rows[:5]
+        )
+        return {
+            "valid": False,
+            "error": (
+                f"CSV has {len(invalid_email_rows)} invalid EMAIL_ID value(s). "
+                f"Fix examples: {examples}"
+            ),
+            "csv_columns": csv_columns,
+            "required_fields": required_fields,
+            "invalid_email_count": len(invalid_email_rows),
+            "invalid_email_sample": invalid_email_rows[:20],
+        }
+
     # Return success with preview
     preview = df.head(5).fillna("").to_dict(orient="records")
     
@@ -593,6 +1023,13 @@ async def send_test_email(
     """
     if not SENDGRID_API_KEY:
         raise HTTPException(status_code=500, detail="SendGrid API key not configured")
+
+    is_valid_email, validation_error = validate_email_address(to_email)
+    if not is_valid_email:
+        return {
+            "success": False,
+            "error": validation_error,
+        }
     
     try:
         # Parse test data
@@ -657,6 +1094,9 @@ async def start_campaign(
     """
     if not SENDGRID_API_KEY:
         raise HTTPException(status_code=500, detail="SendGrid API key not configured")
+
+    if EMAIL_QUEUE_ENABLED and not queue_mode_available():
+        raise HTTPException(status_code=503, detail="Queue mode requires Supabase configuration")
     
     # Parse CSV data
     rows = json.loads(csv_data)
@@ -685,6 +1125,44 @@ async def start_campaign(
         "retry_count": retry_count,
         "template_syntax": template_syntax,
     }
+
+    if queue_mode_available():
+        started_at = datetime.now(timezone.utc).isoformat()
+        await save_campaign_to_db({
+            "id": campaign_id,
+            "status": "queued",
+            "total_emails": len(rows),
+            "sent_count": 0,
+            "failed_count": 0,
+            "from_email": from_email,
+            "subject_pattern": subject_pattern,
+            "rate_per_minute": rate_per_minute,
+            "started_at": started_at,
+            "config_json": json.dumps(build_campaign_config(config, include_template=True)),
+        })
+
+        enqueued = await enqueue_campaign_jobs(campaign_id, rows, retry_count)
+        if not enqueued:
+            await save_campaign_to_db({
+                "id": campaign_id,
+                "status": "failed",
+                "total_emails": len(rows),
+                "sent_count": 0,
+                "failed_count": 0,
+                "from_email": from_email,
+                "subject_pattern": subject_pattern,
+                "rate_per_minute": rate_per_minute,
+                "started_at": started_at,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            })
+            raise HTTPException(status_code=503, detail="Failed to enqueue campaign jobs")
+
+        return {
+            "campaign_id": campaign_id,
+            "total_emails": len(rows),
+            "rate_per_minute": rate_per_minute,
+            "message": f"Campaign queued! Worker will send {len(rows)} emails at {rate_per_minute}/min",
+        }
     
     # Launch the campaign as a background task
     # asyncio.create_task() starts the function running in the background
@@ -716,7 +1194,7 @@ async def get_campaign_progress(campaign_id: str):
                 "limit": "1",
             })
             if result and isinstance(result, list) and len(result) > 0:
-                return result[0]
+                return normalize_campaign_record(result[0])
         except Exception as e:
             logger.error(f"Database query error: {e}")
     
@@ -746,8 +1224,22 @@ async def stream_campaign_progress(campaign_id: str):
                     yield f"data: {json.dumps(progress)}\n\n"
                     break
             else:
-                yield f"data: {json.dumps({'status': 'not_found'})}\n\n"
-                break
+                progress = None
+                if SUPABASE_URL and SUPABASE_KEY:
+                    result = await supabase_request("select", "campaigns", params={
+                        "id": f"eq.{campaign_id}",
+                        "limit": "1",
+                    })
+                    if result and isinstance(result, list) and len(result) > 0:
+                        progress = normalize_campaign_record(result[0])
+
+                if not progress:
+                    yield f"data: {json.dumps({'status': 'not_found'})}\n\n"
+                    break
+
+                yield f"data: {json.dumps(progress)}\n\n"
+                if progress.get("status") in ("completed", "cancelled", "failed"):
+                    break
             
             # Send updates every 2 seconds
             await asyncio.sleep(2)
